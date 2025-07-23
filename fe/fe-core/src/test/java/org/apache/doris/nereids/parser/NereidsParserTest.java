@@ -17,9 +17,14 @@
 
 package org.apache.doris.nereids.parser;
 
+import org.antlr.v4.runtime.CharStreams;
+import org.antlr.v4.runtime.CommonTokenStream;
+import org.apache.doris.analysis.ExplainOptions;
 import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.Pair;
+import org.apache.doris.nereids.PLLexer;
+import org.apache.doris.nereids.PLParser;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.exceptions.ParseException;
@@ -42,6 +47,7 @@ import org.apache.doris.nereids.types.DateType;
 import org.apache.doris.nereids.types.DecimalV2Type;
 import org.apache.doris.nereids.types.DecimalV3Type;
 
+import org.apache.doris.plsql.functions.DorisFunctionRegistry;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -50,6 +56,55 @@ import java.util.Optional;
 import java.util.Set;
 
 public class NereidsParserTest extends ParserTestBase {
+
+    @Test
+    public void testTryParseExplainPlan() {
+        NereidsParser nereidsParser = new NereidsParser();
+        String sql = "/**\n" +
+            "* 描述：\n" +
+            "* 创建人：市公安局-02\n" +
+            "* 创建时间：20250723 20:03:01\n" +
+            "**/\n" +
+            "select t_19.fid_msisdn as fid_msisdn2 -- 手机号\n" +
+            "  , t_19.fid_imei as fid_imei2 -- 机身串号（IMEI）\n" +
+            "  , t_19.fid_imsi as fid_imsi2 -- 卡串号（IMSI）\n" +
+            "  , t_19.fid_app_id as fid_app_id2 -- 应用ID\n" +
+            "  , t_19.app_name_cn as app_name_cn2 -- 应用名称\n" +
+            "  , t_19.restore_file_name as restore_file_name2 -- 文件名\n" +
+            "  , t_19.restore_file_path as restore_file_path2 -- 文件路径\n" +
+            "  , t_19.restore_file_size as restore_file_size2 -- 文件大小\n" +
+            "  , t_19.restore_file_type as restore_file_type2 -- 文件类型\n" +
+            "  , t_19.restore_file_hash as restore_file_hash2 -- 文件HASH值\n" +
+            "  , t_19.ocr_content as ocr_content2 -- 图片提取文本\n" +
+            "  , t_19.ocr_content_tag as ocr_content_tag2 -- 图片提取文本标签\n" +
+            "  , t_19.asr_content as asr_content2 -- 语音转写文本\n" +
+            "  , t_19.asr_content_tag as asr_content_tag2 -- 语音转写文本标签\n" +
+            "  , t_19.mllm_content as mllm_content2 -- 多模态识别结果\n" +
+            "  , t_19.mllm_content_tag as mllm_content_tag2 -- 多模态识别结果标签\n" +
+            "  , t_19.doc_content as doc_content2 -- 文档识别结果\n" +
+            "  , t_19.file_type as file_type2 -- 文件类别\n" +
+            "  , t_19.image_tag_codes as image_tag_codes2 -- 图片标签编码\n" +
+            "  , t_19.image_tag as image_tag2 -- 图片标签名称\n" +
+            "  , t_19.download_url as download_url2 -- 文件下载地址\n" +
+            "  , t_19.chat_type as chat_type2 -- 聊天方式\n" +
+            "  , t_19.data_id as data_id2 -- 数据唯一标识\n" +
+            "  , t_19.capture_time as capture_time2 -- 截获时间\n" +
+            "  , t_19.data_track as data_track2 -- 数据上游表名\n" +
+            "  , t_19.data_source as data_source2 -- 数据来源\n" +
+            "  , t_19.data_source_name as data_source_name2 -- 数据来源名称\n" +
+            "  , t_19.date_id as date_id2 -- 数据写入日期\n" +
+            "from t_19 -- 移网多媒体内容日志主题表";
+//        LogicalPlan logicalPlan = nereidsParser.parseSingle(sql);
+        List<Pair<LogicalPlan, StatementContext>> logicalPlanList = nereidsParser.parseMultiple(sql);
+        System.out.println("");
+
+//        PLLexer lexer = new PLLexer(new CaseInsensitiveStream(CharStreams.fromString(sql)));
+//        CommonTokenStream tokens = new CommonTokenStream(lexer);
+//        PLParser parser = new PLParser(tokens);
+//        DorisFunctionRegistry.ProcedureVisitor visitor = new DorisFunctionRegistry.ProcedureVisitor();
+//        parser.program().accept(visitor);
+//        return visitor.func != null ? visitor.func : visitor.proc;
+    }
 
     @Test
     public void testParseMultiple() {
@@ -76,16 +131,16 @@ public class NereidsParserTest extends ParserTestBase {
     @Test
     public void testErrorListener() {
         parsePlan("select * from t1 where a = 1 illegal_symbol")
-                .assertThrowsExactly(ParseException.class)
-                .assertMessageEquals("\nextraneous input 'illegal_symbol' expecting {<EOF>, ';'}(line 1, pos 29)\n");
+            .assertThrowsExactly(ParseException.class)
+            .assertMessageEquals("\nextraneous input 'illegal_symbol' expecting {<EOF>, ';'}(line 1, pos 29)\n");
     }
 
     @Test
     public void testPostProcessor() {
         parsePlan("select `AD``D` from t1 where a = 1")
-                .matches(
-                        logicalProject().when(p -> "AD`D".equals(p.getProjects().get(0).getName()))
-                );
+            .matches(
+                logicalProject().when(p -> "AD`D".equals(p.getProjects().get(0).getName()))
+            );
     }
 
     @Test
@@ -126,7 +181,7 @@ public class NereidsParserTest extends ParserTestBase {
 
         String windowSql3 = "select rank() over from t1";
         parsePlan(windowSql3).assertThrowsExactly(ParseException.class)
-                    .assertMessageContains("mismatched input 'from' expecting '('");
+            .assertMessageContains("mismatched input 'from' expecting '('");
     }
 
     @Test
@@ -252,13 +307,13 @@ public class NereidsParserTest extends ParserTestBase {
     @Test
     void parseJoinEmptyConditionError() {
         parsePlan("select * from t1 LEFT JOIN t2")
-                .assertThrowsExactly(ParseException.class)
-                .assertMessageEquals("\n"
-                        + "on mustn't be empty except for cross/inner join(line 1, pos 17)\n"
-                        + "\n"
-                        + "== SQL ==\n"
-                        + "select * from t1 LEFT JOIN t2\n"
-                        + "-----------------^^^\n");
+            .assertThrowsExactly(ParseException.class)
+            .assertMessageEquals("\n"
+                + "on mustn't be empty except for cross/inner join(line 1, pos 17)\n"
+                + "\n"
+                + "== SQL ==\n"
+                + "select * from t1 LEFT JOIN t2\n"
+                + "-----------------^^^\n");
     }
 
     @Test
@@ -267,10 +322,10 @@ public class NereidsParserTest extends ParserTestBase {
         NereidsParser nereidsParser = new NereidsParser();
         LogicalPlan logicalPlan = (LogicalPlan) nereidsParser.parseSingle(f1).child(0);
         long doubleCount = logicalPlan
-                .getExpressions()
-                .stream()
-                .mapToLong(e -> e.<Set<DecimalLiteral>>collect(DecimalLiteral.class::isInstance).size())
-                .sum();
+            .getExpressions()
+            .stream()
+            .mapToLong(e -> e.<Set<DecimalLiteral>>collect(DecimalLiteral.class::isInstance).size())
+            .sum();
         Assertions.assertEquals(Config.enable_decimal_conversion ? 0 : 1, doubleCount);
     }
 
@@ -314,16 +369,16 @@ public class NereidsParserTest extends ParserTestBase {
         System.out.println(logicalPlan1.treeString());
 
         String union2 = "(SELECT K1, K2, K3, K4, K5, K6, K7, K8, K9, K10, K11 FROM test WHERE K1 > 0)"
-                + " UNION ALL (SELECT 1, 2, 3, 4, 3.14, 'HELLO', 'WORLD', 0.0, 1.1, CAST('1989-03-21' AS DATE), CAST('1989-03-21 13:00:00' AS DATETIME))"
-                + " UNION ALL (SELECT K1, K2, K3, K4, K5, K6, K7, K8, K9, K10, K11 FROM baseall WHERE K3 > 0)"
-                + " ORDER BY K1, K2, K3, K4";
+            + " UNION ALL (SELECT 1, 2, 3, 4, 3.14, 'HELLO', 'WORLD', 0.0, 1.1, CAST('1989-03-21' AS DATE), CAST('1989-03-21 13:00:00' AS DATETIME))"
+            + " UNION ALL (SELECT K1, K2, K3, K4, K5, K6, K7, K8, K9, K10, K11 FROM baseall WHERE K3 > 0)"
+            + " ORDER BY K1, K2, K3, K4";
         LogicalPlan logicalPlan2 = nereidsParser.parseSingle(union2);
         System.out.println(logicalPlan2.treeString());
 
         String union3 = "select a.k1, a.k2, a.k3, b.k1, b.k2, b.k3 from test a left outer join baseall b"
-                + " on a.k1 = b.k1 and a.k2 > b.k2 union (select a.k1, a.k2, a.k3, b.k1, b.k2, b.k3"
-                + " from test a right outer join baseall b on a.k1 = b.k1 and a.k2 > b.k2)"
-                + " order by isnull(a.k1), 1, 2, 3, 4, 5 limit 65535";
+            + " on a.k1 = b.k1 and a.k2 > b.k2 union (select a.k1, a.k2, a.k3, b.k1, b.k2, b.k3"
+            + " from test a right outer join baseall b on a.k1 = b.k1 and a.k2 > b.k2)"
+            + " order by isnull(a.k1), 1, 2, 3, 4, 5 limit 65535";
         LogicalPlan logicalPlan3 = nereidsParser.parseSingle(union3);
         System.out.println(logicalPlan3.treeString());
     }
@@ -332,43 +387,43 @@ public class NereidsParserTest extends ParserTestBase {
     public void testJoinHint() {
         // no hint
         parsePlan("select * from t1 join t2 on t1.keyy=t2.keyy")
-                .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.NONE));
+            .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.NONE));
 
         // valid hint
         parsePlan("select * from t1 join [shuffle] t2 on t1.keyy=t2.keyy")
-                .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.SHUFFLE_RIGHT));
+            .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.SHUFFLE_RIGHT));
 
         parsePlan("select * from t1 join [  shuffle ] t2 on t1.keyy=t2.keyy")
-                .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.SHUFFLE_RIGHT));
+            .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.SHUFFLE_RIGHT));
 
         parsePlan("select * from t1 join [broadcast] t2 on t1.keyy=t2.keyy")
-                .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.BROADCAST_RIGHT));
+            .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.BROADCAST_RIGHT));
 
         parsePlan("select * from t1 join /*+ broadcast   */ t2 on t1.keyy=t2.keyy")
-                .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.BROADCAST_RIGHT));
+            .matches(logicalJoin().when(j -> j.getDistributeHint().distributeType == DistributeType.BROADCAST_RIGHT));
 
         // invalid hint position
         parsePlan("select * from [shuffle] t1 join t2 on t1.keyy=t2.keyy")
-                .assertThrowsExactly(ParseException.class);
+            .assertThrowsExactly(ParseException.class);
 
         parsePlan("select * from /*+ shuffle */ t1 join t2 on t1.keyy=t2.keyy")
-                .assertThrowsExactly(ParseException.class);
+            .assertThrowsExactly(ParseException.class);
 
         // invalid hint content
         parsePlan("select * from t1 join [bucket] t2 on t1.keyy=t2.keyy")
-                .assertThrowsExactly(ParseException.class)
-                .assertMessageContains("Invalid join hint: bucket(line 1, pos 22)\n"
-                        + "\n"
-                        + "== SQL ==\n"
-                        + "select * from t1 join [bucket] t2 on t1.keyy=t2.keyy\n"
-                        + "----------------------^^^");
+            .assertThrowsExactly(ParseException.class)
+            .assertMessageContains("Invalid join hint: bucket(line 1, pos 22)\n"
+                + "\n"
+                + "== SQL ==\n"
+                + "select * from t1 join [bucket] t2 on t1.keyy=t2.keyy\n"
+                + "----------------------^^^");
 
         // invalid multiple hints
         parsePlan("select * from t1 join /*+ shuffle , broadcast */ t2 on t1.keyy=t2.keyy")
-                .assertThrowsExactly(ParseException.class);
+            .assertThrowsExactly(ParseException.class);
 
         parsePlan("select * from t1 join [shuffle,broadcast] t2 on t1.keyy=t2.keyy")
-                .assertThrowsExactly(ParseException.class);
+            .assertThrowsExactly(ParseException.class);
     }
 
     @Test

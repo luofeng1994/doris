@@ -71,7 +71,8 @@ public class StatementSubmitter {
     private static final String TYPE_EXEC_STATUS = "exec_status";
 
     private static final String JDBC_DRIVER = "org.mariadb.jdbc.Driver";
-    private static final String DB_URL_PATTERN = "jdbc:mariadb://127.0.0.1:%d/%s";
+//    private static final String DB_URL_PATTERN = "jdbc:mariadb://127.0.0.1:%d/%s";
+    private static final String DB_URL_PATTERN = "jdbc:mariadb://172.16.128.95:%d/%s";
 
     private final ThreadPoolExecutor executor = ThreadPoolManager.newDaemonCacheThreadPoolThrowException(
                         Config.http_sql_submitter_max_worker_threads, "SQL submitter", true);
