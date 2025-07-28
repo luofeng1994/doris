@@ -32,6 +32,7 @@ import org.apache.doris.analysis.Expr;
 import org.apache.doris.analysis.QueryStmt;
 import org.apache.doris.analysis.SelectListItem;
 import org.apache.doris.analysis.SelectStmt;
+import org.apache.doris.analysis.SetOperationStmt;
 import org.apache.doris.analysis.SqlParser;
 import org.apache.doris.analysis.SqlScanner;
 import org.apache.doris.analysis.StatementBase;
@@ -62,9 +63,11 @@ import java.io.StringReader;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 
 /**
@@ -140,11 +143,17 @@ public class StmtExecutionPlanAction extends RestBaseController {
             List<Map<String, String>> metaFields = Lists.newArrayList();
             for (int i = 0; i < colLabels.size(); i++) {
                 Map<String, String> field = Maps.newHashMap();
-                field.put("name", colLabels.get(i));
-                field.put("type", resultExprs.get(i).getType().toSql());
+                field.put("name", colLabels.get(i).toLowerCase());
+
+                String type = resultExprs.get(i).getType().toSql();
+                field.put("type",
+                    type.equalsIgnoreCase("time") || type.equalsIgnoreCase("timev2")
+                        ? "string" : type);
                 metaFields.add(field);
             }
             return ResponseEntityBuilder.ok(metaFields);
+        } catch (AnalysisException e) {
+            return getResponseEntity(e, parser, sql);
         } catch (Exception e) {
             return ResponseEntityBuilder.internalError(parser.getErrorMsg(sql));
         }
@@ -157,24 +166,34 @@ public class StmtExecutionPlanAction extends RestBaseController {
             List<StatementBase> statements = SqlParserUtils.getMultiStmts(parser);
             // 1 禁止多个SQL
             if (statements == null || statements.size() > 1) {
-                return ResponseEntityBuilder.internalError("自定义SQL只支持单个查询语句");
+                throw new AnalysisException("自定义SQL只支持单个查询语句");
             }
             stmt = statements.get(0);
+            SelectStmt queryStmt;
             // 2 只允许执行select查询
-            if (!(stmt instanceof SelectStmt)) {
-                return ResponseEntityBuilder.internalError("自定义SQL只支持select语句");
+            if (!(stmt instanceof QueryStmt)) {
+                throw new AnalysisException("自定义SQL只支持select语句");
+            }
+            if (stmt instanceof SelectStmt) {
+                queryStmt = (SelectStmt) stmt;
+            } else {
+                queryStmt = (SelectStmt) ((SetOperationStmt) stmt).getOperands().get(0).getQueryStmt();
             }
             // 3 禁止使用with xx as ( select * from xxx)
-            SelectStmt queryStmt = (SelectStmt) stmt;
             if (queryStmt.getWithClause() != null) {
-                return ResponseEntityBuilder.internalError("自定义SQL不支持with as cte语法");
+                throw new AnalysisException("自定义SQL不支持with as cte语法");
             }
-            // 4 select字段 获取 alias 判断是否空
+
+            // 4 获取select字段后注释信息
+            Map<String, String> descriptions = getFieldDescriptions(sql);
+            // 5 select字段 获取 alias 判断是否空
+            List<Map<String, String>> metaFields = Lists.newArrayList();
             for (SelectListItem item : queryStmt.getSelectList().getItems()) {
                 String alias = item.getAlias();
                 if (StringUtils.isBlank(alias)) {
-                    return ResponseEntityBuilder.internalError("自定义SQL中Select字段别名不能为空");
+                    throw new AnalysisException("自定义SQL中Select字段别名不能为空");
                 }
+                alias = alias.replace("`", "").toLowerCase();
                 // 检查是否包含中文（循环遍历字符）
                 boolean hasChinese = false;
                 for (char c : alias.toCharArray()) {
@@ -184,48 +203,52 @@ public class StmtExecutionPlanAction extends RestBaseController {
                     }
                 }
                 if (hasChinese || !alias.matches(COLUMN_NAME_REGEX)) {
-                    return ResponseEntityBuilder.internalError("自定义SQL中Select字段别名不能包含中文及特殊符号");
+                    throw new AnalysisException("自定义SQL中Select字段别名不能包含中文及特殊符号");
                 }
-            }
-            // 5 获取select字段后注释信息
-            Map<String, String> descriptions = getFieldDescriptions(sql);
 
-            Analyzer analyzer = new Analyzer(Env.getCurrentEnv(), ConnectContext.get());
-            queryStmt.analyze(analyzer);
-            ArrayList<String> colLabels = queryStmt.getColLabels();
-            ArrayList<Expr> resultExprs = queryStmt.getResultExprs();
-            List<Map<String, String>> metaFields = Lists.newArrayList();
-            for (int i = 0; i < colLabels.size(); i++) {
                 Map<String, String> field = Maps.newHashMap();
-                String name = colLabels.get(i);
-                if (!descriptions.containsKey(name)) {
-                    throw new RuntimeException("请按照规范设置最外层所有查询字段的注释信息");
+                if (!descriptions.containsKey(alias)) {
+                    throw new AnalysisException("请按照规范设置最外层所有查询字段的注释信息");
                 }
-                field.put("name", name);
-                field.put("comment", descriptions.get(name));
-                field.put("type", resultExprs.get(i).getType().toSql());
+                field.put("name", alias);
+                field.put("comment", descriptions.get(alias));
                 metaFields.add(field);
             }
             return ResponseEntityBuilder.ok(metaFields);
         } catch (AnalysisException e) {
-            return ResponseEntityBuilder.internalError(parser.getErrorMsg(sql));
+            return getResponseEntity(e, parser, sql);
         } catch (Exception e) {
-            return ResponseEntityBuilder.internalError(e.getMessage());
+            return ResponseEntityBuilder.internalError(parser.getErrorMsg(sql));
         }
     }
 
-    public Map<String, String> getFieldDescriptions(String sql) {
+    @NotNull
+    private static ResponseEntity getResponseEntity(AnalysisException e, SqlParser parser, String sql) {
+        String errMsg = e.getMessage();
+        String detailMessage = "detailMessage = ";
+        // 判断是否包含detailMessage =
+        if (errMsg.contains(detailMessage)) {
+            errMsg = errMsg.substring(errMsg.indexOf(detailMessage) + detailMessage.length());
+            if (errMsg.equals("Syntax error")) {
+                return ResponseEntityBuilder.internalError(parser.getErrorMsg(sql));
+            }
+            return ResponseEntityBuilder.internalError(errMsg);
+        }
+        return ResponseEntityBuilder.internalError(errMsg);
+    }
+
+    public Map<String, String> getFieldDescriptions(String sql) throws AnalysisException {
         FLDorisLexer lexer = new FLDorisLexer(CharStreams.fromString(sql));
         CommonTokenStream tokens = new CommonTokenStream(lexer);
         FLDorisParser flparser = new FLDorisParser(tokens);
-        ParseTree tree = flparser.selectColumnClause();
+        ParseTree tree = flparser.selectClause();
         Map<String, String> descriptions = new HashMap<>();
         try {
-            SelectCommentExtractor visitor = new SelectCommentExtractor();
+            SelectCommentExtractor visitor = new SelectCommentExtractor(tokens);
             visitor.visit(tree);
             descriptions = visitor.getFieldDescriptions();
         } catch (Exception e) {
-            throw new RuntimeException(e);
+            throw new AnalysisException("获取字段与注释信息报错," + e.getMessage());
         }
         return descriptions;
     }
@@ -238,6 +261,22 @@ class StmtRequestBody {
 
 class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
     private Map<String, String> fieldDescriptions = new LinkedHashMap<>();
+    private Set<String> comments = new HashSet<>();
+    private CommonTokenStream tokenStream;
+
+    public SelectCommentExtractor(CommonTokenStream tokenStream) {
+        this.tokenStream = tokenStream;
+    }
+
+
+    @Override
+    public Void visitSelectClause(FLDorisParser.SelectClauseContext ctx) {
+        FLDorisParser.SelectColumnClauseContext selectColumnClause = ctx.selectColumnClause();
+        if (selectColumnClause != null) {
+            visitSelectColumnClause(selectColumnClause);
+        }
+        return null;
+    }
 
     @Override
     public Void visitSelectColumnClause(FLDorisParser.SelectColumnClauseContext ctx) {
@@ -249,59 +288,77 @@ class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
     }
 
     @Override
+    public Void visitNamedExpressionSeq(FLDorisParser.NamedExpressionSeqContext ctx) {
+        for (int i = 0; i < ctx.namedExpression().size(); i++) {
+            FLDorisParser.NamedExpressionContext namedExpr = ctx.namedExpression(i);
+            visitNamedExpression(namedExpr);
+        }
+        // 处理 COMMA 后的 SIMPLE_COMMENT（如果存在）
+        for (int i = 0; i < ctx.COMMA().size(); i++) {
+            Token commaComment = ctx.SELECT_FIELD_COMMENT(i) != null ? ctx.SELECT_FIELD_COMMENT(i).getSymbol() : null;
+            if (commaComment != null && !commaComment.getText().isEmpty()) {
+                // 如果逗号后有注释，归属到前一个字段（特殊情况处理）
+                String prevField = ctx.namedExpression(i).identifierOrText() != null
+                    ? ctx.namedExpression(i).identifierOrText().getText()
+                    : ctx.namedExpression(i).expression().getText();
+                String description = commaComment.getText().substring(2).trim().toLowerCase();
+                if (StringUtils.isBlank(description)) {
+                    throw new RuntimeException("注释不能为空");
+                }
+                if (comments.contains(description)) {
+                    throw new RuntimeException("注释重复了:" + description);
+                }
+                comments.add(description);
+                fieldDescriptions.put(prevField.replace("`", "").toLowerCase(), description);
+            }
+        }
+        return null;
+    }
+
+    @Override
     public Void visitNamedExpression(FLDorisParser.NamedExpressionContext ctx) {
         String fieldName;
         String description = null;
 
-        // 获取字段名
+        // Determine field name
         if (ctx.identifierOrText() != null) {
             fieldName = ctx.identifierOrText().getText();
         } else {
             fieldName = ctx.expression().getText();
         }
 
-        // 获取最后一个非注释Token的行号
-        int lastExprLine = -1;
-        // 处理AS或别名的行号
-        if (ctx.AS() != null) {
-            lastExprLine = ctx.AS().getSymbol().getLine();
-        } else if (ctx.identifierOrText() != null) {
-            lastExprLine = ctx.identifierOrText().getStop().getLine();
-        } else {
-            // 获取表达式结束行号
-            FLDorisParser.ExpressionContext expr = ctx.expression();
-            if (expr != null && expr.getStop() != null) {
-                lastExprLine = expr.getStop().getLine();
+        // Get the line number of the field
+        int fieldLine = (ctx.identifierOrText() != null)
+            ? ctx.identifierOrText().getStop().getLine()
+            : ctx.expression().getStop().getLine();
+
+        // Check for comment within the namedExpression
+        if (ctx.SELECT_FIELD_COMMENT() != null) {
+            Token commentToken = ctx.SELECT_FIELD_COMMENT().getSymbol();
+            if (commentToken.getLine() == fieldLine) {
+                description = commentToken.getText().substring(2).trim().toLowerCase();
             }
         }
 
-        // 处理字段注释
-        Token commentToken = ctx.SELECT_FIELD_COMMENT() != null ? ctx.SELECT_FIELD_COMMENT().getSymbol() : null;
-        if (commentToken != null) {
-            int commentLine = commentToken.getLine();
-            // 仅当注释与字段在同一行时处理
-            if (commentLine == lastExprLine) {
-                description = commentToken.getText().substring(2).trim();
-            }
-        }
-
-        // 默认描述为字段名或空（根据需求调整）
+        // Default description to fieldName if no comment is found yet
         if (description == null) {
-            description = fieldName;
+            description = fieldName.toLowerCase();
         }
 
+        // Validate description
         if (description.contains("'")) {
             throw new RuntimeException("注释不能包含单引号");
         }
-        fieldDescriptions.put(fieldName, description);
-        return null;
-    }
 
-    @Override
-    public Void visitNamedExpressionSeq(FLDorisParser.NamedExpressionSeqContext ctx) {
-        for (FLDorisParser.NamedExpressionContext namedExpr : ctx.namedExpression()) {
-            visitNamedExpression(namedExpr);
+        if (StringUtils.isBlank(description)) {
+            throw new RuntimeException("注释不能为空");
         }
+
+        if (comments.contains(description)) {
+            throw new RuntimeException("注释重复了:" + description);
+        }
+        comments.add(description);
+        fieldDescriptions.put(fieldName.replace("`", "").toLowerCase(), description);
         return null;
     }
 
@@ -309,5 +366,3 @@ class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
         return fieldDescriptions;
     }
 }
-
-

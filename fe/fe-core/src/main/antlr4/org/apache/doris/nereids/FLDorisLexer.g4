@@ -109,7 +109,7 @@ ANTI: 'ANTI';
 APPEND: 'APPEND';
 ARRAY: 'ARRAY';
 ARRAY_RANGE: 'ARRAY_RANGE';
-AS: 'AS' | 'as';
+AS: [Aa][Ss];
 ASC: 'ASC';
 AT: 'AT';
 AUTHORS: 'AUTHORS';
@@ -474,7 +474,7 @@ SCHEDULER: 'SCHEDULER';
 SCHEMA: 'SCHEMA';
 SCHEMAS: 'SCHEMAS';
 SECOND: 'SECOND';
-SELECT: 'SELECT';
+SELECT: [Ss][Ee][Ll][Ee][Cc][Tt];
 SEMI: 'SEMI';
 SEQUENCE: 'SEQUENCE';
 SERIALIZABLE: 'SERIALIZABLE';
@@ -665,6 +665,10 @@ fragment LETTER
     | ~[\u0000-\u007F\uD800-\uDBFF] // covers all characters above 0x7F which are not a surrogate
     | [\uD800-\uDBFF] [\uDC00-\uDFFF] // covers UTF-16 surrogate pairs encodings for U+10000 to U+10FFFF
     ;
+
+//SELECT_FIELD_COMMENT
+//    : '--' ~[\r\n]*
+//    ;
 
 SELECT_FIELD_COMMENT
     : '--' ~[\r\n]* {getCharPositionInLine() > 0}?
