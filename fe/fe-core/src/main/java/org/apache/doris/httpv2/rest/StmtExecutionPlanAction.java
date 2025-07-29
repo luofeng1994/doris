@@ -25,6 +25,9 @@ import com.google.gson.reflect.TypeToken;
 import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
 import org.antlr.v4.runtime.Token;
+import org.antlr.v4.runtime.TokenSource;
+import org.antlr.v4.runtime.TokenFactory;
+import org.antlr.v4.runtime.CharStream;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.doris.analysis.Analyzer;
@@ -59,6 +62,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+import java.io.Serializable;
 import java.io.StringReader;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
@@ -68,6 +72,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import org.antlr.v4.runtime.tree.TerminalNode;
 
 
 /**
@@ -109,6 +114,7 @@ public class StmtExecutionPlanAction extends RestBaseController {
 
         String sql = stmtRequestBody.stmt;
         boolean validate = stmtRequestBody.sql_validate;
+        boolean condition = stmtRequestBody.sql_condition;
         if (Strings.isNullOrEmpty(sql)) {
             return ResponseEntityBuilder.badRequest("Missing statement request body");
         }
@@ -122,7 +128,13 @@ public class StmtExecutionPlanAction extends RestBaseController {
 //        }
         ConnectContext.get().changeDefaultCatalog(ns);
         ConnectContext.get().setDatabase(getFullDbName(dbName));
-        return validate ? validateSql(sql) : getSchema(sql);
+        if (validate) {
+            return validateSql(sql);
+        } else if (condition) {
+            return conditionSql(sql);
+        } else {
+            return getSchema(sql);
+        }
     }
 
     @NotNull
@@ -222,6 +234,39 @@ public class StmtExecutionPlanAction extends RestBaseController {
         }
     }
 
+    private ResponseEntity conditionSql(String sql) {
+        SqlParser parser = new SqlParser(new SqlScanner(new StringReader(sql)));
+        StatementBase stmt = null;
+        try {
+            List<StatementBase> statements = SqlParserUtils.getMultiStmts(parser);
+            // 1 禁止多个SQL
+            if (statements == null || statements.size() > 1) {
+                throw new AnalysisException("自定义SQL只支持单个查询语句");
+            }
+            stmt = statements.get(0);
+            SelectStmt queryStmt;
+            // 2 只允许执行select查询
+            if (!(stmt instanceof QueryStmt)) {
+                throw new AnalysisException("自定义SQL只支持select语句");
+            }
+            if (stmt instanceof SelectStmt) {
+                queryStmt = (SelectStmt) stmt;
+            } else {
+                queryStmt = (SelectStmt) ((SetOperationStmt) stmt).getOperands().get(0).getQueryStmt();
+            }
+            // 3 禁止使用with xx as ( select * from xxx)
+            if (queryStmt.getWithClause() != null) {
+                throw new AnalysisException("自定义SQL不支持with as cte语法");
+            }
+            // 4 获取where条件信息
+            List<FilterCondition> conditions = getWhereConditions(sql);
+            return ResponseEntityBuilder.ok(conditions);
+        } catch (AnalysisException e) {
+            return getResponseEntity(e, parser, sql);
+        } catch (Exception e) {
+            return ResponseEntityBuilder.internalError(parser.getErrorMsg(sql));
+        }
+    }
     @NotNull
     private static ResponseEntity getResponseEntity(AnalysisException e, SqlParser parser, String sql) {
         String errMsg = e.getMessage();
@@ -252,11 +297,51 @@ public class StmtExecutionPlanAction extends RestBaseController {
         }
         return descriptions;
     }
+
+    /**
+     * 从SQL中提取WHERE条件
+     * @param sql SQL语句
+     * @return 过滤条件列表
+     * @throws AnalysisException 解析异常
+     */
+    public List<FilterCondition> getWhereConditions(String sql) throws AnalysisException {
+        FLDorisLexer lexer = new FLDorisLexer(CharStreams.fromString(sql));
+        CommonTokenStream tokens = new CommonTokenStream(lexer);
+        
+        // 过滤掉SELECT_FIELD_COMMENT token，避免影响WHERE条件解析
+        tokens.fill();
+        List<Token> filteredTokens = new ArrayList<>();
+        for (int i = 0; i < tokens.size(); i++) {
+            Token token = tokens.get(i);
+            // 跳过SELECT_FIELD_COMMENT token
+            if (token.getType() != FLDorisLexer.SELECT_FIELD_COMMENT) {
+                filteredTokens.add(token);
+            }
+        }
+        
+        // 使用过滤后的tokens重新创建token stream
+        CommonTokenStream filteredTokenStream = new CommonTokenStream(lexer);
+        filteredTokenStream.getTokens().clear();
+        filteredTokenStream.getTokens().addAll(filteredTokens);
+        
+        FLDorisParser flparser = new FLDorisParser(filteredTokenStream);
+        ParseTree tree = flparser.querySpecification();
+        List<FilterCondition> conditions = new ArrayList<>();
+        try {
+            WhereConditionExtractor visitor = new WhereConditionExtractor(filteredTokenStream);
+            visitor.visit(tree);
+            conditions = visitor.getConditions();
+        } catch (Exception e) {
+            throw new AnalysisException("提取WHERE条件信息报错," + e.getMessage());
+        }
+        return conditions;
+    }
 }
 
 class StmtRequestBody {
     public String stmt;
     public boolean sql_validate;
+    public boolean sql_condition;
 }
 
 class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
@@ -364,5 +449,298 @@ class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
 
     public Map<String, String> getFieldDescriptions() {
         return fieldDescriptions;
+    }
+}
+
+class FilterCondition implements Serializable {
+    private String column;           // 过滤列
+    private String operator;         // 条件类型（=, >, <, IN, LIKE等）
+    private List<String> valueList;  // 条件值列表，支持多值
+    private String originalText;     // 原始文本，用于调试
+    private boolean isNot;           // 是否是NOT条件
+    
+    // 构造函数 - 支持单个值
+    public FilterCondition(String column, String operator, String value, String originalText, boolean isNot) {
+        this.column = column;
+        this.operator = operator;
+        this.valueList = new ArrayList<>();
+        if (value != null) {
+            this.valueList.add(value);
+        }
+        this.originalText = originalText;
+        this.isNot = isNot;
+    }
+    
+    // 构造函数 - 支持多个值
+    public FilterCondition(String column, String operator, List<String> valueList, String originalText, boolean isNot) {
+        this.column = column;
+        this.operator = operator;
+        this.valueList = valueList != null ? new ArrayList<>(valueList) : new ArrayList<>();
+        this.originalText = originalText;
+        this.isNot = isNot;
+    }
+
+
+    // getter and setter, for json serialization
+    public String getColumn() {
+        return column;
+    }
+
+    public void setColumn(String column) {
+        this.column = column;
+    }
+
+    public String getOperator() {
+        return operator;
+    }
+
+    public void setOperator(String operator) {
+        this.operator = operator;
+    }
+
+    public List<String> getValueList() {
+        return valueList;
+    }
+
+    public void setValueList(List<String> valueList) {
+        this.valueList = valueList;
+    }
+
+    public String getOriginalText() {
+        return originalText;
+    }
+
+    public void setOriginalText(String originalText) {
+        this.originalText = originalText;
+    }
+
+    public boolean isNot() {
+        return isNot;
+    }
+
+    public void setNot(boolean not) {
+        isNot = not;
+    }
+
+    @Override
+    public String toString() {
+        return String.format("FilterCondition{column='%s', operator='%s', valueList=%s, isNot=%s, originalText='%s'}", 
+                column, operator, valueList, isNot, originalText);
+    }
+}
+
+class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
+    private List<FilterCondition> conditions = new ArrayList<>();
+    private CommonTokenStream tokenStream;
+    
+    public WhereConditionExtractor(CommonTokenStream tokenStream) {
+        this.tokenStream = tokenStream;
+    }
+    
+    @Override
+    public Void visitWhereClause(FLDorisParser.WhereClauseContext ctx) {
+        if (ctx.booleanExpression() != null) {
+            visitBooleanExpression(ctx.booleanExpression());
+        }
+        return null;
+    }
+    
+    public Void visitBooleanExpression(FLDorisParser.BooleanExpressionContext ctx) {
+        return visit(ctx);
+    }
+    
+    @Override
+    public Void visitLogicalBinary(FLDorisParser.LogicalBinaryContext ctx) {
+        // 处理 AND/OR 操作，递归访问左右子表达式
+        visit(ctx.left);
+        visit(ctx.right);
+        return null;
+    }
+    
+    @Override
+    public Void visitPredicated(FLDorisParser.PredicatedContext ctx) {
+        if (ctx.predicate() != null) {
+            // 有谓词的情况，如 column IN (values) 或 column LIKE pattern
+            visitPredicateWithColumn(ctx.valueExpression(), ctx.predicate());
+        } else {
+            // 没有谓词，可能是简单的值表达式，继续向下访问
+            visit(ctx.valueExpression());
+        }
+        return null;
+    }
+    
+    @Override
+    public Void visitComparison(FLDorisParser.ComparisonContext ctx) {
+        // 处理比较操作，如 column = value, column > value 等
+        String leftColumn = extractColumnName(ctx.left);
+        String rightValue = extractValue(ctx.right);
+        String operator = ctx.comparisonOperator().getText();
+        
+        if (leftColumn != null && rightValue != null) {
+            FilterCondition condition = new FilterCondition(
+                leftColumn, 
+                operator, 
+                rightValue, 
+                ctx.getText(),
+                false
+            );
+            conditions.add(condition);
+        }
+        return null;
+    }
+    
+    private void visitPredicateWithColumn(FLDorisParser.ValueExpressionContext valueExpr, 
+                                        FLDorisParser.PredicateContext predicate) {
+        String column = extractColumnName(valueExpr);
+        if (column == null) return;
+        
+        boolean isNot = predicate.NOT() != null;
+        
+        if (predicate.kind != null) {
+            String operator = predicate.kind.getText().toUpperCase();
+            
+            switch (operator) {
+                case "IN":
+                    handleInPredicate(column, predicate, isNot);
+                    break;
+                case "LIKE":
+                case "REGEXP":
+                case "RLIKE":
+                    String pattern = extractValue(predicate.pattern);
+                    if (pattern != null) {
+                        FilterCondition condition = new FilterCondition(
+                            column, 
+                            operator, 
+                            pattern, 
+                            predicate.getText(),
+                            isNot
+                        );
+                        conditions.add(condition);
+                    }
+                    break;
+                case "BETWEEN":
+                    String lowerValue = extractValue(predicate.lower);
+                    String upperValue = extractValue(predicate.upper);
+                    if (lowerValue != null && upperValue != null) {
+                        List<String> betweenValues = new ArrayList<>();
+                        betweenValues.add(lowerValue);
+                        betweenValues.add(upperValue);
+                        FilterCondition condition = new FilterCondition(
+                            column, 
+                            "BETWEEN", 
+                            betweenValues,  // 使用多值构造函数
+                            predicate.getText(),
+                            isNot
+                        );
+                        conditions.add(condition);
+                    }
+                    break;
+                case "NULL":
+                    FilterCondition condition = new FilterCondition(
+                        column, 
+                        "IS NULL", 
+                        "NULL", 
+                        predicate.getText(),
+                        isNot
+                    );
+                    conditions.add(condition);
+                    break;
+            }
+        }
+    }
+    
+    private void handleInPredicate(String column, FLDorisParser.PredicateContext predicate, boolean isNot) {
+        if (predicate.query() != null) {
+            // IN (subquery) 的情况 - 子查询作为单个值处理
+            FilterCondition condition = new FilterCondition(
+                column, 
+                "IN", 
+                "(" + predicate.query().getText() + ")", 
+                predicate.getText(),
+                isNot
+            );
+            conditions.add(condition);
+        } else if (predicate.expression() != null && !predicate.expression().isEmpty()) {
+            // IN (value1, value2, ...) 的情况 - 使用多值构造函数
+            List<String> values = new ArrayList<>();
+            for (FLDorisParser.ExpressionContext expr : predicate.expression()) {
+                String value = extractValue(expr);
+                if (value != null) {
+                    values.add(value);
+                }
+            }
+            if (!values.isEmpty()) {
+                FilterCondition condition = new FilterCondition(
+                    column, 
+                    "IN", 
+                    values,  // 直接传递List<String>
+                    predicate.getText(),
+                    isNot
+                );
+                conditions.add(condition);
+            }
+        }
+    }
+    
+    private String extractColumnName(FLDorisParser.ValueExpressionContext ctx) {
+        return extractColumnName((ParseTree) ctx);
+    }
+    
+    private String extractColumnName(FLDorisParser.ExpressionContext ctx) {
+        return extractColumnName((ParseTree) ctx);
+    }
+    
+    private String extractColumnName(ParseTree ctx) {
+        if (ctx == null) return null;
+        
+        // 简单的列引用检测
+        String text = ctx.getText();
+        
+        // 移除反引号
+        if (text.startsWith("`") && text.endsWith("`")) {
+            text = text.substring(1, text.length() - 1);
+        }
+        
+        // 如果包含点号，取最后一部分作为列名
+        if (text.contains(".")) {
+            String[] parts = text.split("\\.");
+            text = parts[parts.length - 1];
+            if (text.startsWith("`") && text.endsWith("`")) {
+                text = text.substring(1, text.length() - 1);
+            }
+        }
+        
+        // 简单验证是否看起来像列名（字母、数字、下划线）
+        if (text.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
+            return text;
+        }
+        
+        return null;
+    }
+    
+    private String extractValue(FLDorisParser.ValueExpressionContext ctx) {
+        return extractValue((ParseTree) ctx);
+    }
+    
+    private String extractValue(FLDorisParser.ExpressionContext ctx) {
+        return extractValue((ParseTree) ctx);
+    }
+    
+    private String extractValue(ParseTree ctx) {
+        if (ctx == null) return null;
+        
+        String text = ctx.getText();
+        
+        // 移除字符串字面量的引号
+        if ((text.startsWith("'") && text.endsWith("'")) || 
+            (text.startsWith("\"") && text.endsWith("\""))) {
+            return text.substring(1, text.length() - 1);
+        }
+        
+        return text;
+    }
+    
+    public List<FilterCondition> getConditions() {
+        return conditions;
     }
 }
