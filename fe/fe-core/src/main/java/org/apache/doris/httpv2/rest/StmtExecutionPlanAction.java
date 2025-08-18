@@ -25,20 +25,9 @@ import com.google.gson.reflect.TypeToken;
 import org.antlr.v4.runtime.CharStreams;
 import org.antlr.v4.runtime.CommonTokenStream;
 import org.antlr.v4.runtime.Token;
-import org.antlr.v4.runtime.TokenSource;
-import org.antlr.v4.runtime.TokenFactory;
-import org.antlr.v4.runtime.CharStream;
 import org.antlr.v4.runtime.tree.ParseTree;
 import org.apache.commons.lang3.StringUtils;
-import org.apache.doris.analysis.Analyzer;
-import org.apache.doris.analysis.Expr;
-import org.apache.doris.analysis.QueryStmt;
-import org.apache.doris.analysis.SelectListItem;
-import org.apache.doris.analysis.SelectStmt;
-import org.apache.doris.analysis.SetOperationStmt;
-import org.apache.doris.analysis.SqlParser;
-import org.apache.doris.analysis.SqlScanner;
-import org.apache.doris.analysis.StatementBase;
+import org.apache.doris.analysis.*;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.util.SqlParserUtils;
@@ -54,25 +43,14 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
 import org.springframework.http.ResponseEntity;
-import org.springframework.web.bind.annotation.PathVariable;
-import org.springframework.web.bind.annotation.RequestBody;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestMethod;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
 
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.Serializable;
 import java.io.StringReader;
 import java.lang.reflect.Type;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import org.antlr.v4.runtime.tree.TerminalNode;
+import java.util.*;
 
 
 /**
@@ -304,11 +282,11 @@ public class StmtExecutionPlanAction extends RestBaseController {
      * @return 过滤条件列表
      * @throws AnalysisException 解析异常
      */
-    public List<FilterCondition> getWhereConditions(String sql) throws AnalysisException {
+    public List<FilterCondition> getWhereConditions(String sql) throws Exception {
         FLDorisLexer lexer = new FLDorisLexer(CharStreams.fromString(sql));
         CommonTokenStream tokens = new CommonTokenStream(lexer);
-        
-        // 过滤掉SELECT_FIELD_COMMENT token，避免影响WHERE条件解析
+
+        // // 过滤掉SELECT_FIELD_COMMENT token，避免影响WHERE条件解析
         tokens.fill();
         List<Token> filteredTokens = new ArrayList<>();
         for (int i = 0; i < tokens.size(); i++) {
@@ -316,26 +294,29 @@ public class StmtExecutionPlanAction extends RestBaseController {
             // 跳过SELECT_FIELD_COMMENT token
             if (token.getType() != FLDorisLexer.SELECT_FIELD_COMMENT) {
                 filteredTokens.add(token);
+            } else {
+                System.out.println("SELECT_FIELD_COMMENT token found at index " + i + ": " + token.getText());
             }
         }
-        
+
         // 使用过滤后的tokens重新创建token stream
         CommonTokenStream filteredTokenStream = new CommonTokenStream(lexer);
         filteredTokenStream.getTokens().clear();
         filteredTokenStream.getTokens().addAll(filteredTokens);
-        
+
         FLDorisParser flparser = new FLDorisParser(filteredTokenStream);
         ParseTree tree = flparser.querySpecification();
         List<FilterCondition> conditions = new ArrayList<>();
         try {
-            WhereConditionExtractor visitor = new WhereConditionExtractor(filteredTokenStream);
+            WhereConditionExtractor visitor = new WhereConditionExtractor(tokens);
             visitor.visit(tree);
             conditions = visitor.getConditions();
         } catch (Exception e) {
-            throw new AnalysisException("提取WHERE条件信息报错," + e.getMessage());
+            throw new Exception("提取WHERE条件信息报错," + e.getMessage());
         }
         return conditions;
     }
+
 }
 
 class StmtRequestBody {
@@ -353,6 +334,14 @@ class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
         this.tokenStream = tokenStream;
     }
 
+    @Override
+    public Void visitRegularQuerySpecification(FLDorisParser.RegularQuerySpecificationContext ctx) {
+        // 确保访问selectClause
+        if (ctx.selectClause() != null) {
+            visitSelectClause(ctx.selectClause());
+        }
+        return null;
+    }
 
     @Override
     public Void visitSelectClause(FLDorisParser.SelectClauseContext ctx) {
@@ -452,15 +441,21 @@ class SelectCommentExtractor extends FLDorisParserBaseVisitor<Void> {
     }
 }
 
+enum ConditionType {
+    WHERE,    // WHERE子句中的条件
+    JOIN      // JOIN ON子句中的条件
+}
+
 class FilterCondition implements Serializable {
     private String column;           // 过滤列
     private String operator;         // 条件类型（=, >, <, IN, LIKE等）
     private List<String> valueList;  // 条件值列表，支持多值
     private String originalText;     // 原始文本，用于调试
     private boolean isNot;           // 是否是NOT条件
-    
+    private ConditionType type;      // 条件类型：WHERE条件或JOIN条件
+
     // 构造函数 - 支持单个值
-    public FilterCondition(String column, String operator, String value, String originalText, boolean isNot) {
+    public FilterCondition(String column, String operator, String value, String originalText, boolean isNot, ConditionType type) {
         this.column = column;
         this.operator = operator;
         this.valueList = new ArrayList<>();
@@ -469,15 +464,27 @@ class FilterCondition implements Serializable {
         }
         this.originalText = originalText;
         this.isNot = isNot;
+        this.type = type;
     }
-    
+
     // 构造函数 - 支持多个值
-    public FilterCondition(String column, String operator, List<String> valueList, String originalText, boolean isNot) {
+    public FilterCondition(String column, String operator, List<String> valueList, String originalText, boolean isNot, ConditionType type) {
         this.column = column;
         this.operator = operator;
         this.valueList = valueList != null ? new ArrayList<>(valueList) : new ArrayList<>();
         this.originalText = originalText;
         this.isNot = isNot;
+        this.type = type;
+    }
+
+    // 兼容旧代码的构造函数 - 默认为WHERE条件
+    public FilterCondition(String column, String operator, String value, String originalText, boolean isNot) {
+        this(column, operator, value, originalText, isNot, ConditionType.WHERE);
+    }
+
+    // 兼容旧代码的构造函数 - 默认为WHERE条件
+    public FilterCondition(String column, String operator, List<String> valueList, String originalText, boolean isNot) {
+        this(column, operator, valueList, originalText, isNot, ConditionType.WHERE);
     }
 
 
@@ -522,21 +529,96 @@ class FilterCondition implements Serializable {
         isNot = not;
     }
 
+    public ConditionType getType() {
+        return type;
+    }
+
+    public void setType(ConditionType type) {
+        this.type = type;
+    }
+
     @Override
     public String toString() {
-        return String.format("FilterCondition{column='%s', operator='%s', valueList=%s, isNot=%s, originalText='%s'}", 
-                column, operator, valueList, isNot, originalText);
+        return String.format("FilterCondition{type=%s, column='%s', operator='%s', valueList=%s, isNot=%s, originalText='%s'}",
+            type, column, operator, valueList, isNot, originalText);
     }
 }
 
 class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
     private List<FilterCondition> conditions = new ArrayList<>();
     private CommonTokenStream tokenStream;
-    
+    private ConditionType currentConditionType = ConditionType.WHERE; // 当前处理的条件类型
+
     public WhereConditionExtractor(CommonTokenStream tokenStream) {
         this.tokenStream = tokenStream;
     }
-    
+
+    @Override
+    public Void visitRegularQuerySpecification(FLDorisParser.RegularQuerySpecificationContext ctx) {
+        // 确保访问whereClause
+        if (ctx.whereClause() != null) {
+            visitWhereClause(ctx.whereClause());
+        }
+
+        // 手动访问其他部分以避免重复访问whereClause
+        if (ctx.selectClause() != null) {
+            visit(ctx.selectClause());
+        }
+        if (ctx.fromClause() != null) {
+            visit(ctx.fromClause());
+        }
+        if (ctx.aggClause() != null) {
+            visit(ctx.aggClause());
+        }
+        if (ctx.havingClause() != null) {
+            visit(ctx.havingClause());
+        }
+        if (ctx.queryOrganization() != null) {
+            visit(ctx.queryOrganization());
+        }
+
+        return null;
+    }
+
+    // 添加对FROM子句中子查询的支持
+    @Override
+    public Void visitAliasedQuery(FLDorisParser.AliasedQueryContext ctx) {
+        // 递归访问子查询
+        if (ctx.query() != null) {
+            visit(ctx.query());
+        }
+        return null;
+    }
+
+    // 添加对表达式中子查询的支持
+    @Override
+    public Void visitSubqueryExpression(FLDorisParser.SubqueryExpressionContext ctx) {
+        // 递归访问子查询
+        if (ctx.query() != null) {
+            visit(ctx.query());
+        }
+        return null;
+    }
+
+    // 添加对JOIN条件的处理
+    @Override
+    public Void visitJoinRelation(FLDorisParser.JoinRelationContext ctx) {
+        // 处理JOIN条件时设置上下文为JOIN
+        if (ctx.joinCriteria() != null) {
+            ConditionType savedType = currentConditionType;
+            currentConditionType = ConditionType.JOIN;
+            visit(ctx.joinCriteria());
+            currentConditionType = savedType; // 恢复之前的上下文
+        }
+
+        // 继续处理其他部分（如右表）
+        if (ctx.right != null) {
+            visit(ctx.right);
+        }
+
+        return null;
+    }
+
     @Override
     public Void visitWhereClause(FLDorisParser.WhereClauseContext ctx) {
         if (ctx.booleanExpression() != null) {
@@ -544,11 +626,11 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
         }
         return null;
     }
-    
+
     public Void visitBooleanExpression(FLDorisParser.BooleanExpressionContext ctx) {
         return visit(ctx);
     }
-    
+
     @Override
     public Void visitLogicalBinary(FLDorisParser.LogicalBinaryContext ctx) {
         // 处理 AND/OR 操作，递归访问左右子表达式
@@ -556,7 +638,7 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
         visit(ctx.right);
         return null;
     }
-    
+
     @Override
     public Void visitPredicated(FLDorisParser.PredicatedContext ctx) {
         if (ctx.predicate() != null) {
@@ -568,37 +650,38 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
         }
         return null;
     }
-    
+
     @Override
     public Void visitComparison(FLDorisParser.ComparisonContext ctx) {
         // 处理比较操作，如 column = value, column > value 等
         String leftColumn = extractColumnName(ctx.left);
         String rightValue = extractValue(ctx.right);
         String operator = ctx.comparisonOperator().getText();
-        
+
         if (leftColumn != null && rightValue != null) {
             FilterCondition condition = new FilterCondition(
-                leftColumn, 
-                operator, 
-                rightValue, 
+                leftColumn,
+                operator,
+                rightValue,
                 ctx.getText(),
-                false
+                false,
+                currentConditionType
             );
             conditions.add(condition);
         }
         return null;
     }
-    
-    private void visitPredicateWithColumn(FLDorisParser.ValueExpressionContext valueExpr, 
-                                        FLDorisParser.PredicateContext predicate) {
+
+    private void visitPredicateWithColumn(FLDorisParser.ValueExpressionContext valueExpr,
+                                          FLDorisParser.PredicateContext predicate) {
         String column = extractColumnName(valueExpr);
         if (column == null) return;
-        
+
         boolean isNot = predicate.NOT() != null;
-        
+
         if (predicate.kind != null) {
             String operator = predicate.kind.getText().toUpperCase();
-            
+
             switch (operator) {
                 case "IN":
                     handleInPredicate(column, predicate, isNot);
@@ -609,11 +692,12 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
                     String pattern = extractValue(predicate.pattern);
                     if (pattern != null) {
                         FilterCondition condition = new FilterCondition(
-                            column, 
-                            operator, 
-                            pattern, 
+                            column,
+                            operator,
+                            pattern,
                             predicate.getText(),
-                            isNot
+                            isNot,
+                            currentConditionType
                         );
                         conditions.add(condition);
                     }
@@ -626,40 +710,46 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
                         betweenValues.add(lowerValue);
                         betweenValues.add(upperValue);
                         FilterCondition condition = new FilterCondition(
-                            column, 
-                            "BETWEEN", 
+                            column,
+                            "BETWEEN",
                             betweenValues,  // 使用多值构造函数
                             predicate.getText(),
-                            isNot
+                            isNot,
+                            currentConditionType
                         );
                         conditions.add(condition);
                     }
                     break;
                 case "NULL":
                     FilterCondition condition = new FilterCondition(
-                        column, 
-                        "IS NULL", 
-                        "NULL", 
+                        column,
+                        "IS NULL",
+                        "NULL",
                         predicate.getText(),
-                        isNot
+                        isNot,
+                        currentConditionType
                     );
                     conditions.add(condition);
                     break;
             }
         }
     }
-    
+
     private void handleInPredicate(String column, FLDorisParser.PredicateContext predicate, boolean isNot) {
         if (predicate.query() != null) {
             // IN (subquery) 的情况 - 子查询作为单个值处理
             FilterCondition condition = new FilterCondition(
-                column, 
-                "IN", 
-                "(" + predicate.query().getText() + ")", 
+                column,
+                "IN",
+                "(" + predicate.query().getText() + ")",
                 predicate.getText(),
-                isNot
+                isNot,
+                currentConditionType
             );
             conditions.add(condition);
+
+            // 递归访问IN子查询中的WHERE条件
+            visit(predicate.query());
         } else if (predicate.expression() != null && !predicate.expression().isEmpty()) {
             // IN (value1, value2, ...) 的情况 - 使用多值构造函数
             List<String> values = new ArrayList<>();
@@ -671,36 +761,37 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
             }
             if (!values.isEmpty()) {
                 FilterCondition condition = new FilterCondition(
-                    column, 
-                    "IN", 
+                    column,
+                    "IN",
                     values,  // 直接传递List<String>
                     predicate.getText(),
-                    isNot
+                    isNot,
+                    currentConditionType
                 );
                 conditions.add(condition);
             }
         }
     }
-    
+
     private String extractColumnName(FLDorisParser.ValueExpressionContext ctx) {
         return extractColumnName((ParseTree) ctx);
     }
-    
+
     private String extractColumnName(FLDorisParser.ExpressionContext ctx) {
         return extractColumnName((ParseTree) ctx);
     }
-    
+
     private String extractColumnName(ParseTree ctx) {
         if (ctx == null) return null;
-        
+
         // 简单的列引用检测
         String text = ctx.getText();
-        
+
         // 移除反引号
         if (text.startsWith("`") && text.endsWith("`")) {
             text = text.substring(1, text.length() - 1);
         }
-        
+
         // 如果包含点号，取最后一部分作为列名
         if (text.contains(".")) {
             String[] parts = text.split("\\.");
@@ -709,37 +800,37 @@ class WhereConditionExtractor extends FLDorisParserBaseVisitor<Void> {
                 text = text.substring(1, text.length() - 1);
             }
         }
-        
+
         // 简单验证是否看起来像列名（字母、数字、下划线）
         if (text.matches("[a-zA-Z_][a-zA-Z0-9_]*")) {
             return text;
         }
-        
+
         return null;
     }
-    
+
     private String extractValue(FLDorisParser.ValueExpressionContext ctx) {
         return extractValue((ParseTree) ctx);
     }
-    
+
     private String extractValue(FLDorisParser.ExpressionContext ctx) {
         return extractValue((ParseTree) ctx);
     }
-    
+
     private String extractValue(ParseTree ctx) {
         if (ctx == null) return null;
-        
+
         String text = ctx.getText();
-        
+
         // 移除字符串字面量的引号
-        if ((text.startsWith("'") && text.endsWith("'")) || 
+        if ((text.startsWith("'") && text.endsWith("'")) ||
             (text.startsWith("\"") && text.endsWith("\""))) {
             return text.substring(1, text.length() - 1);
         }
-        
+
         return text;
     }
-    
+
     public List<FilterCondition> getConditions() {
         return conditions;
     }

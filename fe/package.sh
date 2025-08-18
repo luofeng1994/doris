@@ -15,9 +15,10 @@ jar cf abc.jar -C abc .
 
 # doris-fe-extends.jar
 mkdir -p doris-fe-extends/org/apache/doris/httpv2/rest/
+cp fe-core/target/classes/org/apache/doris/httpv2/rest/ConditionType.class doris-fe-extends/org/apache/doris/httpv2/rest
+cp fe-core/target/classes/org/apache/doris/httpv2/rest/FilterCondition.class doris-fe-extends/org/apache/doris/httpv2/rest
+cp fe-core/target/classes/org/apache/doris/httpv2/rest/SelectCommentExtractor.class doris-fe-extends/org/apache/doris/httpv2/rest
 cp fe-core/target/classes/org/apache/doris/httpv2/rest/StmtExecutionPlanAction* doris-fe-extends/org/apache/doris/httpv2/rest
 cp fe-core/target/classes/org/apache/doris/httpv2/rest/StmtRequestBody.class doris-fe-extends/org/apache/doris/httpv2/rest
-cp fe-core/target/classes/org/apache/doris/httpv2/rest/SelectCommentExtractor.class doris-fe-extends/org/apache/doris/httpv2/rest
-cp fe-core/target/classes/org/apache/doris/httpv2/rest/FilterCondition.class doris-fe-extends/org/apache/doris/httpv2/rest
 cp fe-core/target/classes/org/apache/doris/httpv2/rest/WhereConditionExtractor.class doris-fe-extends/org/apache/doris/httpv2/rest
 jar cf doris-fe-extends.jar -C doris-fe-extends .
