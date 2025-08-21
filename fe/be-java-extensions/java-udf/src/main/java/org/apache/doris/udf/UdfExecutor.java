@@ -42,6 +42,7 @@ import java.util.Map;
 public class UdfExecutor extends BaseExecutor {
     public static final Logger LOG = Logger.getLogger(UdfExecutor.class);
     public static final String UDF_PREPARE_FUNCTION_NAME = "prepare";
+    public static final String UDF_BATCHED_FUNCTION_NAME = "evaluateBatched";
 
     // setup by init() and cleared by close()
     private Method method;
@@ -97,27 +98,104 @@ public class UdfExecutor extends BaseExecutor {
                 outputTable.close();
             }
             outputTable = VectorTable.createWritableTable(outputParams, numRows);
+            boolean isBatched = fn.scalar_fn.symbol.toLowerCase().contains("batched");
 
-            // If the return type is primitive, we can't cast the array of primitive type as array of Object,
-            // so we have to new its wrapped Object.
-            Object[] result = outputTable.getColumnType(0).isPrimitive()
-                    ? outputTable.getColumn(0).newObjectContainerArray(numRows)
-                    : (Object[]) Array.newInstance(method.getReturnType(), numRows);
-            Object[][] inputs = inputTable.getMaterializedData(getInputConverters(numColumns));
-            Object[] parameters = new Object[numColumns];
-            for (int i = 0; i < numRows; ++i) {
-                for (int j = 0; j < numColumns; ++j) {
-                    parameters[j] = inputs[j][i];
-                }
-                result[i] = methodAccess.invoke(udf, evaluateIndex, parameters);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("fn.scalar_fn.symbol: " + fn.scalar_fn.symbol);
+                LOG.debug("isBatched before evaluate: " + isBatched);
             }
-            boolean isNullable = Boolean.parseBoolean(outputParams.getOrDefault("is_nullable", "true"));
-            outputTable.appendData(0, result, getOutputConverter(), isNullable);
-            return outputTable.getMetaAddress();
+
+            if (isBatched) {
+                return evaluateBatched(inputTable, numRows, numColumns, outputParams);
+            } else {
+                return evaluateRowByRow(inputTable, numRows, numColumns, outputParams);
+            }
         } catch (Exception e) {
             LOG.warn("evaluate exception: " + debugString(), e);
             throw new UdfRuntimeException("UDF failed to evaluate", e);
         }
+    }
+
+    /**
+     * 向量化处理：一次性处理所有行数据
+     */
+    private long evaluateBatched(VectorTable inputTable, int numRows, int numColumns, Map<String, String> outputParams)
+            throws Exception {
+        // 获取所有输入列的数据，转换为ArrayList格式
+        Object[][] inputs = inputTable.getMaterializedData(getInputConverters(numColumns));
+        Object[] parameters = new Object[numColumns];
+
+        // 将每列数据转换为ArrayList
+        for (int j = 0; j < numColumns; ++j) {
+            parameters[j] = convertToArrayList(inputs[j]);
+        }
+
+        // 调用向量化UDF的evaluate方法
+        Class<?>[] batchedArgClasses = new Class<?>[numColumns];
+        for (int j = 0; j < numColumns; ++j) {
+            batchedArgClasses[j] = java.util.ArrayList.class;
+        }
+        int evaluateBatchedIndex = methodAccess.getIndex(UDF_BATCHED_FUNCTION_NAME, batchedArgClasses);
+        Object result = methodAccess.invoke(udf, evaluateBatchedIndex, parameters);
+
+        // 验证结果数量是否与行数一致
+        if (result instanceof java.util.Collection) {
+            int resultSize = ((java.util.Collection<?>) result).size();
+            if (resultSize != numRows) {
+                throw new UdfRuntimeException(
+                        String.format("Batched UDF result size (%d) does not match input rows (%d)",
+                                resultSize, numRows));
+            }
+        } else {
+            throw new UdfRuntimeException("Batched UDF must return a Collection type");
+        }
+
+        // 将结果转换为数组并写入输出表
+        java.util.Collection<?> col = (java.util.Collection<?>) result;
+        Object[] resultArray = outputTable.getColumn(0).newObjectContainerArray(numRows);
+        int idx = 0;
+        for (Object v : col) {
+            resultArray[idx++] = v;
+        }
+        boolean isNullable = Boolean.parseBoolean(outputParams.getOrDefault("is_nullable", "true"));
+        outputTable.appendData(0, resultArray, getOutputConverter(), isNullable);
+
+        return outputTable.getMetaAddress();
+    }
+
+    /**
+     * 原有的一行一行处理逻辑
+     */
+    private long evaluateRowByRow(VectorTable inputTable, int numRows, int numColumns, Map<String, String> outputParams)
+            throws Exception {
+        // If the return type is primitive, we can't cast the array of primitive type as
+        // array of Object,
+        // so we have to new its wrapped Object.
+        Object[] result = outputTable.getColumnType(0).isPrimitive()
+                ? outputTable.getColumn(0).newObjectContainerArray(numRows)
+                : (Object[]) Array.newInstance(method.getReturnType(), numRows);
+        Object[][] inputs = inputTable.getMaterializedData(getInputConverters(numColumns));
+        Object[] parameters = new Object[numColumns];
+        for (int i = 0; i < numRows; ++i) {
+            for (int j = 0; j < numColumns; ++j) {
+                parameters[j] = inputs[j][i];
+            }
+            result[i] = methodAccess.invoke(udf, evaluateIndex, parameters);
+        }
+        boolean isNullable = Boolean.parseBoolean(outputParams.getOrDefault("is_nullable", "true"));
+        outputTable.appendData(0, result, getOutputConverter(), isNullable);
+        return outputTable.getMetaAddress();
+    }
+
+    /**
+     * 将数组转换为ArrayList
+     */
+    private java.util.ArrayList<?> convertToArrayList(Object[] array) {
+        java.util.ArrayList<Object> list = new java.util.ArrayList<>(array.length);
+        for (Object item : array) {
+            list.add(item);
+        }
+        return list;
     }
 
     public Method getMethod() {
